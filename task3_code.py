@@ -1,188 +1,233 @@
-import os
-import re
-import warnings
+# -*- coding: utf-8 -*-
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib as mpl
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+import seaborn as sns
+import warnings
+import os
+import re
+from scipy import stats
+
+# Advanced Modeling
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
 from xgboost import XGBRegressor
 import shap
-import statsmodels.api as sm
-from statsmodels.regression.mixed_linear_model import MixedLM
+from sklearn.preprocessing import LabelEncoder
 
-# 设定中文与负号显示
-def set_chinese_plot_style():
-    mpl.rcParams["axes.unicode_minus"] = False
-    mpl.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "Arial Unicode MS", "DejaVu Sans"]
-    mpl.rcParams["figure.dpi"] = 130
-    mpl.rcParams["savefig.dpi"] = 260
-    mpl.rcParams["figure.figsize"] = (10, 6)
+# ==========================================
+# 0. Style Setup
+# ==========================================
+def set_style():
+    try:
+        sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+    except:
+        plt.style.use('seaborn-whitegrid')
+        
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif']
+    plt.rcParams['mathtext.fontset'] = 'stix'
+    plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['axes.spines.top'] = False
+    plt.rcParams['axes.spines.right'] = False
+    
+    global C_MAIN
+    C_MAIN = "#004aad" 
 
-# 读取原始数据
-def load_raw_data(data_csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(data_csv_path)
-    return df
+set_style()
+warnings.filterwarnings('ignore')
 
-# 解析week和judge列
-def parse_week_judge_columns(df: pd.DataFrame):
-    pat = re.compile(r"week(\d+)_judge(\d+)_score")
-    week_judge_cols = []
-    for c in df.columns:
-        m = pat.fullmatch(c)
-        if m:
-            week = int(m.group(1))
-            judge = int(m.group(2))
-            week_judge_cols.append((week, judge, c))
-    week_judge_cols.sort(key=lambda x: (x[0], x[1]))
-    weeks = sorted(list({w for w, _, _ in week_judge_cols}))
-    return week_judge_cols, weeks
+# ==========================================
+# 1. Data Pipeline
+# ==========================================
 
-# 宽表转换为长表
-def wide_to_long_week_level(df: pd.DataFrame) -> pd.DataFrame:
-    week_judge_cols, weeks = parse_week_judge_columns(df)
-    id_cols = [
-        "celebrity_name", "ballroom_partner", "celebrity_industry", "celebrity_homestate",
-        "celebrity_homecountry/region", "celebrity_age_during_season", "season", "results", "placement"
-    ]
-    rows = []
-    for _, r in df.iterrows():
-        base = {k: r.get(k, np.nan) for k in id_cols}
-        for w in weeks:
-            score_cols = [col for (ww, jj, col) in week_judge_cols if ww == w]
-            scores = r[score_cols].astype(float)
-            if scores.isna().all():
-                continue
-            total = np.nansum(scores.values)
-            if total <= 0:
-                continue
-            out = base.copy()
-            out["week"] = w
-            out["judge_total_score"] = float(total)
-            out["judge_count"] = int(np.sum(~scores.isna()))
-            out["judge_avg_score"] = float(total / max(1, out["judge_count"]))
-            rows.append(out)
-    long_df = pd.DataFrame(rows)
-    long_df["season"] = long_df["season"].astype(int)
-    long_df["week"] = long_df["week"].astype(int)
-    long_df["celebrity_age_during_season"] = pd.to_numeric(long_df["celebrity_age_during_season"], errors="coerce")
-    return long_df
+class DataIntegrator:
+    def __init__(self, t1_path, raw_path):
+        self.t1_path = t1_path
+        self.raw_path = raw_path
+        
+    def _find_file(self, filename):
+        dirs = [os.getcwd(), r"C:\Users\85269\OneDrive\Desktop\T3V2", 
+                r"C:\Users\85269\OneDrive\Desktop"]
+        if os.path.exists(filename): return filename
+        for d in dirs:
+            if not d: continue
+            fp = os.path.join(d, filename)
+            if os.path.exists(fp): return fp
+        raise FileNotFoundError(f"Missing {filename}")
 
-# 添加赛制特征
-def add_institution_features(df_long: pd.DataFrame) -> pd.DataFrame:
-    df = df_long.copy()
-    df["Is_Rank"] = ((df["season"] <= 2) | (df["season"] >= 28)).astype(int)
-    df["Age_x_IsRank"] = df["celebrity_age_during_season"] * df["Is_Rank"]
-    return df
+    def load_and_merge(self):
+        print("[1] Loading Data...")
+        t1_path = self._find_file(self.t1_path)
+        raw_path = self._find_file(self.raw_path)
+        
+        t1_df = pd.read_csv(t1_path)
+        t1_df['dancer_clean'] = t1_df['dancer'].str.strip().str.lower()
+        
+        try: raw_df = pd.read_csv(raw_path, encoding='utf-8-sig')
+        except: raw_df = pd.read_csv(raw_path, encoding='ISO-8859-1')
+        
+        raw_df.columns = raw_df.columns.str.strip().str.replace('ï»¿', '')
+        if 'celebrity_name' not in raw_df.columns:
+            col = [c for c in raw_df.columns if 'celebrity' in c.lower()][0]
+            raw_df.rename(columns={col: 'celebrity_name'}, inplace=True)
+            
+        # Melt
+        score_cols = [c for c in raw_df.columns if 'judge' in c and 'score' in c]
+        meta_cols = ['season', 'celebrity_name', 'ballroom_partner', 
+                     'celebrity_age_during_season', 'celebrity_gender']
+        
+        melted = raw_df.melt(id_vars=[c for c in meta_cols if c in raw_df.columns], 
+                             value_vars=score_cols, value_name='score', var_name='w')
+        melted['week'] = melted['w'].str.extract(r'week(\d+)_').astype(float)
+        melted = melted.dropna(subset=['score', 'week'])
+        
+        # Aggregation
+        agg_funcs = {'score': 'sum'}
+        for c in meta_cols: 
+            if c in melted.columns and c not in ['season', 'celebrity_name']:
+                agg_funcs[c] = 'first'
+                
+        feat_df = melted.groupby(['season', 'week', 'celebrity_name']).agg(agg_funcs).reset_index()
+        feat_df.rename(columns={'score': 'judge_total'}, inplace=True)
+        feat_df['dancer_clean'] = feat_df['celebrity_name'].str.strip().str.lower()
+        
+        # Merge
+        full = pd.merge(t1_df, feat_df, on=['season', 'week', 'dancer_clean'], how='inner')
+        full['judge_share'] = full.groupby(['season', 'week'])['judge_total'].transform(lambda x: x/x.sum())
+        
+        print(f"    Merged Shape: {full.shape}")
+        return full
 
-# 加载或生成task1的soft label（估算选票、置信区间宽度、权重）
-def load_or_generate_task1_votes(df_long: pd.DataFrame, task1_path="task1_votes.csv") -> pd.DataFrame:
-    df = df_long.copy()
-    if os.path.exists(task1_path):
-        t1 = pd.read_csv(task1_path)
-        t1["season"] = t1["season"].astype(int)
-        t1["week"] = t1["week"].astype(int)
-        merged = df.merge(t1, on=["celebrity_name", "season", "week"], how="left")
-        if merged["est_votes"].isna().any() or merged["ci_width"].isna().any():
-            print("[警告] task1_votes.csv 与主数据无法完全匹配，存在缺失。")
-            merged = generate_fallback_votes(merged)
-        else:
-            eps = 1e-6
-            merged["weight_w"] = 1.0 / (merged["ci_width"].astype(float) + eps)
-        return merged
-    else:
-        print("[提示] 未找到 task1_votes.csv，将自动生成示例 soft label（仅用于跑通流程/出图）。")
-        return generate_fallback_votes(df)
+# ==========================================
+# 2. Analysis Modules
+# ==========================================
 
-# 生成缺失的投票数据
-def generate_fallback_votes(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    industry = out["celebrity_industry"].fillna("Unknown").astype(str)
-    pop_map = {
-        "Actor/Actress": 1.15, "Singer/Rapper": 1.10, "Athlete": 1.05, "Model": 1.05,
-        "Reality TV": 1.08, "TV Personality": 1.06, "Comedian": 1.03, "Radio Host": 1.12, "Unknown": 1.00
-    }
-    ind_pop = industry.map(lambda x: pop_map.get(x, 1.00)).astype(float)
-    placement = pd.to_numeric(out["placement"], errors="coerce").fillna(out["placement"].median())
-    base_pop = 1.0 / (placement + 1.0)
-    base_pop = (base_pop - base_pop.min()) / (base_pop.max() - base_pop.min() + 1e-9) + 0.3
-    judge = out["judge_total_score"].astype(float)
-    judge_scaled = (judge - judge.min()) / (judge.max() - judge.min() + 1e-9) + 0.5
-    rng = np.random.default_rng(20260131)
-    noise = rng.lognormal(mean=0.0, sigma=0.25, size=len(out))
-    est_votes = 1e6 * ind_pop * judge_scaled * base_pop * noise
-    out["est_votes"] = est_votes
-    season = out["season"].astype(int)
-    week = out["week"].astype(int)
-    ci = (0.35 + 0.8 * np.exp(-(season - 1) / 6.0)) * (1.0 + 0.15 / (week + 1.0))
-    ci_width = ci * out["est_votes"].astype(float) * 0.25
-    out["ci_width"] = ci_width
-    eps = 1e-6
-    out["weight_w"] = 1.0 / (out["ci_width"].astype(float) + eps)
-    return out
+def analyze_kingmaker(df):
+    print("\n[Analysis] Kingmaker Index...")
+    df['premium'] = df['p_hat'] - df['judge_share']
+    stats = df.groupby('ballroom_partner')['premium'].agg(['mean', 'count']).reset_index()
+    stats = stats[stats['count'] > 5].sort_values('mean', ascending=False)
+    stats.rename(columns={'mean': 'PCI'}, inplace=True)
+    
+    # Plot
+    plt.figure(figsize=(10, 6), dpi=300)
+    top_bot = pd.concat([stats.head(5), stats.tail(5)])
+    sns.barplot(data=top_bot, x='PCI', y='ballroom_partner', palette='RdBu_r')
+    plt.title("Kingmaker Index (Partner Popularity Contribution)", fontweight='bold')
+    plt.axvline(0, color='k')
+    plt.tight_layout()
+    plt.savefig("Task3_Kingmaker.png")
+    return stats
 
-# 训练和评估模型
-def train_xgb_and_shap(df: pd.DataFrame, target_col: str, sample_weight_col=None, model_name="judge"):
-    num_features = ["celebrity_age_during_season", "Is_Rank", "Age_x_IsRank", "Partner_PCI", "PCI_x_IsRank", "week"]
-    cat_features = ["celebrity_industry"]
-    X = df[num_features + cat_features].copy()
-    y = df[target_col].astype(float).values
-    pre = ColumnTransformer(
-        transformers=[("num", "passthrough", num_features), ("cat", OneHotEncoder(handle_unknown="ignore"), cat_features)],
-        remainder="drop"
-    )
-    xgb = XGBRegressor(
-        n_estimators=800, learning_rate=0.03, max_depth=4, subsample=0.85, colsample_bytree=0.85,
-        reg_alpha=0.0, reg_lambda=1.0, random_state=20260131, n_jobs=4, objective="reg:squarederror"
-    )
-    pipe = Pipeline([("pre", pre), ("xgb", xgb)])
-    X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
-        X, y, df.index.values, test_size=0.22, random_state=20260131
-    )
-    if sample_weight_col is not None:
-        sw = df[sample_weight_col].astype(float).values
-        sw_train = sw[np.isin(df.index.values, idx_train)]
-        sw_test = sw[np.isin(df.index.values, idx_test)]
-    else:
-        sw_train = None
-        sw_test = None
-    pipe.fit(X_train, y_train, xgb__sample_weight=sw_train)
-    y_pred = pipe.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    r2 = r2_score(y_test, y_pred)
-    print(f"\n[{model_name.upper()}] 目标={target_col}  测试RMSE={rmse:.4f}  R2={r2:.4f}")
-    X_all_trans = pipe.named_steps["pre"].transform(X)
-    booster = pipe.named_steps["xgb"]
-    explainer = shap.TreeExplainer(booster)
-    shap_values = explainer.shap_values(X_all_trans)
-    ohe = pipe.named_steps["pre"].named_transformers_["cat"]
-    ohe_names = list(ohe.get_feature_names_out(["celebrity_industry"]))
-    feature_names = num_features + ohe_names
-    return pipe, explainer, shap_values, X_all_trans, feature_names
+def run_econometrics(df):
+    """ Robust Elasticity Analysis: LMM -> OLS Fallback """
+    print("\n[Analysis] Econometric Elasticity Model...")
+    
+    # Prep
+    model_df = df.dropna(subset=['judge_share', 'celebrity_age_during_season']).copy()
+    # Normalize features to help convergence
+    model_df['judge_z'] = (model_df['judge_share'] - model_df['judge_share'].mean()) / model_df['judge_share'].std()
+    model_df['age_z'] = (model_df['celebrity_age_during_season'] - model_df['celebrity_age_during_season'].mean()) / model_df['celebrity_age_during_season'].std()
+    
+    formula = "p_hat ~ judge_z + age_z"
+    
+    try:
+        # Attempt 1: Mixed Linear Model
+        print("    Attempting Mixed Linear Model (LMM)...")
+        md = smf.mixedlm(formula, model_df, groups=model_df["season"])
+        # Use more robust optimizer
+        mdf = md.fit(method='lbfgs', maxiter=100) 
+        print(mdf.summary())
+        coef = mdf.params['judge_z']
+        
+    except Exception as e:
+        print(f"    [Warn] LMM Failed ({str(e)}). Falling back to OLS with Fixed Effects.")
+        # Attempt 2: OLS with Season Dummy Variables (Fixed Effects)
+        formula_fe = "p_hat ~ judge_z + age_z + C(season)"
+        md = smf.ols(formula_fe, data=model_df)
+        mdf = md.fit()
+        print(mdf.summary())
+        coef = mdf.params['judge_z']
 
-# 主程序执行
+    # Interpret (Std Beta)
+    print(f"\n>> RESULT: Standardized Judge Elasticity = {coef:.4f}")
+    print("   (Impact of 1 SD increase in Judge Share on Fan Vote Share)")
+    return mdf
+
+def run_shap_analysis(df, pci_stats):
+    print("\n[Analysis] Machine Learning Attribution (XGBoost)...")
+    
+    # Merge PCI
+    df = pd.merge(df, pci_stats[['ballroom_partner', 'PCI']], on='ballroom_partner', how='left').fillna(0)
+    
+    # Prep Data
+    features = ['judge_share', 'celebrity_age_during_season', 'PCI', 'week']
+    X = df[features].fillna(0)
+    y = df['p_hat']
+    
+    # Model
+    model = XGBRegressor(n_estimators=300, max_depth=4, learning_rate=0.05, random_state=42)
+    model.fit(X, y)
+    print(f"    Model R2: {model.score(X, y):.4f}")
+    
+    # SHAP
+    explainer = shap.Explainer(model)
+    shap_values = explainer(X)
+    
+    # Plot 1: Summary
+    plt.figure(figsize=(10, 6), dpi=300)
+    shap.summary_plot(shap_values, X, show=False, cmap='coolwarm')
+    plt.title("Driver Analysis: Global Feature Importance", fontweight='bold')
+    plt.tight_layout()
+    plt.savefig("Task3_SHAP_Summary.png")
+    
+    # Plot 2: Controversy Anatomy (Jerry Rice)
+    try:
+        jerry = df[df['celebrity_name'].str.contains('Jerry Rice', case=False)]
+        if not jerry.empty:
+            # Pick the week with highest Vote Premium
+            idx = (jerry['p_hat'] - jerry['judge_share']).idxmax()
+            row_idx = df.index.get_loc(idx)
+            
+            plt.figure(figsize=(10, 4), dpi=300)
+            shap.plots.waterfall(shap_values[row_idx], show=False)
+            plt.title(f"Anatomy of a Controversy: Jerry Rice (Week {df.loc[idx, 'week']:.0f})", fontweight='bold')
+            plt.tight_layout()
+            plt.savefig("Task3_Controversy.png")
+            print("    Saved 'Task3_Controversy.png'")
+    except Exception as e:
+        print(f"    Skipped Jerry Rice plot: {e}")
+
+# ==========================================
+# 3. Main
+# ==========================================
+
 def main():
-    set_chinese_plot_style()
-    DATA_CSV = "2026_MCM_Problem_C_Data.csv"
-    if not os.path.exists(DATA_CSV):
-        alt = "/mnt/data/2026-01-31-13-P3qHBTxqD12d0E2A7DNE.csv"
-        if os.path.exists(alt):
-            DATA_CSV = alt
-        else:
-            raise FileNotFoundError("未找到数据文件 2026_MCM_Problem_C_Data.csv，请检查路径。")
-    print(f"读取数据：{DATA_CSV}")
-    df_raw = load_raw_data(DATA_CSV)
-    df_long = wide_to_long_week_level(df_raw)
-    print("\n周级长表 df_long：")
-    print(df_long.head())
-    df_long = add_institution_features(df_long)
-    df_long = load_or_generate_task1_votes(df_long)
-    df_long.to_csv("out_task3_clean_long.csv", index=False, encoding="utf-8-sig")
-    print("\n已保存：out_task3_clean_long.csv")
+    print("="*60)
+    print("Task 3: Robust Driver Analysis")
+    print("="*60)
+    
+    t1_file = "Task1_Voting_Inference_Optimized.csv"
+    raw_file = "2026_MCM_Problem_C_Data.csv"
+    
+    try:
+        integrator = DataIntegrator(t1_file, raw_file)
+        full_data = integrator.load_and_merge()
+    except Exception as e:
+        print(e); return
+        
+    # 1. Partner Effect
+    pci_stats = analyze_kingmaker(full_data)
+    
+    # 2. Elasticity (Auto-Fallback enabled)
+    run_econometrics(full_data)
+    
+    # 3. ML Attribution
+    run_shap_analysis(full_data, pci_stats)
+    
+    print("\n[Done] All Task 3 outputs generated.")
 
 if __name__ == "__main__":
     main()
